@@ -39,7 +39,7 @@ if WindUI then
     Window =
         WindUI:CreateWindow(
         {
-            Title = "yomo 🔫 | 0.2 | Premium  ",
+            Title = "yomo 🔫 | 0.1z | Premium  ",
             Icon = "cloud-lightning",
             Author = "mo",
             Folder = "yomo Now",
@@ -252,17 +252,37 @@ pcall(
 )
 
 -- == New Features Variables ==
--- Anti-Aim (spin visible to others, not to you)
-local AntiAimEnabled = false
+-- Combined Anti-Lock / Anti-Aim (user requested to combine)
+local CombinedAntiLockEnabled = false -- main combined toggle
+local AntiAimEnabled = false -- spinning visible to others
 local AntiAimSpeed = 540 -- degrees per second (default fast spin)
+-- Keep original AntiLock (sky) values toggled by combined toggle
+getgenv().Sky = false
+getgenv().SkyAmount = 1500
+
+-- Impact-trigger (เมื่อโดนชนหรือ "เซ" ให้เปิด anti-aim/anti-lock ชั่วคราว)
+local ImpactTriggerEnabled = true
+local ImpactTriggerDuration = 3 -- seconds
+local _impactActiveUntil = 0
+
 -- Leg sink (ทำให้ขาจมดินโดยปรับ HipHeight)
 local LegSinkEnabled = false
 local LegSinkAmount = 0.5 -- studs to sink (positive number will lower hips)
 local originalHipHeight = nil
+
 -- Run time / extra sprint (เพิ่มความเร็ว/เวลาวิ่ง)
 local RunTimeBoostEnabled = false
 local RunTimeMultiplier = 1.5 -- multiplier for WalkSpeed when boosted
 local originalWalkSpeed = nil
+
+-- High jump (support mobile)
+local HighJumpEnabled = false
+local HighJumpPower = 70 -- JumpPower when enabled (default higher than normal)
+local originalJumpPower = nil
+local usingJumpPower = true -- prefer JumpPower if available
+
+-- Internal helpers for restoring toggles
+local _prevCombinedState = false
 
 -- == Utility Functions ==
 local function getPing()
@@ -348,6 +368,12 @@ local function setupCharacter(char)
             originalWalkSpeed = 16
         end
     end
+    if originalJumpPower == nil and Humanoid then
+        pcall(function() originalJumpPower = Humanoid.JumpPower end)
+        if originalJumpPower == nil then
+            originalJumpPower = 50
+        end
+    end
     -- apply leg sink if enabled
     if LegSinkEnabled and Humanoid then
         pcall(function() Humanoid.HipHeight = (originalHipHeight or 0) - LegSinkAmount end)
@@ -355,6 +381,10 @@ local function setupCharacter(char)
     -- apply run boost if enabled
     if RunTimeBoostEnabled and Humanoid then
         pcall(function() Humanoid.WalkSpeed = (originalWalkSpeed or 16) * RunTimeMultiplier end)
+    end
+    -- apply high jump if enabled
+    if HighJumpEnabled and Humanoid then
+        pcall(function() Humanoid.JumpPower = HighJumpPower end)
     end
 
     if moveConnection then
@@ -1546,7 +1576,17 @@ RunService.RenderStepped:Connect(
 -- Anti-Aim spinning (visible to others, keep camera intact locally)
 RunService.RenderStepped:Connect(function(delta)
     pcall(function()
-        if AntiAimEnabled and HumanoidRootPart and Camera then
+        -- Determine if anti-aim should be active: either combined toggle is on OR impact-based temporary activation
+        local antiAimShouldBeOn = false
+        if CombinedAntiLockEnabled then
+            antiAimShouldBeOn = true
+        end
+        -- temporary impact activation
+        if tick() < _impactActiveUntil then
+            antiAimShouldBeOn = true
+        end
+
+        if antiAimShouldBeOn and HumanoidRootPart and Camera then
             local camCFrame = Camera.CFrame -- save current camera frame so we can restore it after rotating HRP
             local yawIncrement = math.rad(AntiAimSpeed) * delta
             -- rotate HumanoidRootPart (this will replicate to others)
@@ -1554,27 +1594,94 @@ RunService.RenderStepped:Connect(function(delta)
             -- keep local camera the same so player doesn't feel rotated
             Camera.CFrame = camCFrame
         end
+        -- apply sky if combined enabled or impact active
+        if CombinedAntiLockEnabled or tick() < _impactActiveUntil then
+            getgenv().Sky = true
+        else
+            getgenv().Sky = false
+        end
     end)
 end)
 
--- Keep leg sink/HipHeight and run boost applied if toggles are on
+-- Keep leg sink/HipHeight, run boost, and high jump applied if toggles are on
 RunService.Heartbeat:Connect(function()
     pcall(function()
         if LegSinkEnabled and Humanoid then
             Humanoid.HipHeight = (originalHipHeight or 0) - LegSinkAmount
-        end
-        if not LegSinkEnabled and Humanoid and originalHipHeight ~= nil then
-            -- ensure restoration if disabled
+        elseif Humanoid and originalHipHeight ~= nil then
             Humanoid.HipHeight = originalHipHeight
         end
+
         if RunTimeBoostEnabled and Humanoid then
             Humanoid.WalkSpeed = (originalWalkSpeed or 16) * RunTimeMultiplier
-        end
-        if not RunTimeBoostEnabled and Humanoid and originalWalkSpeed ~= nil then
+        elseif Humanoid and originalWalkSpeed ~= nil then
             Humanoid.WalkSpeed = originalWalkSpeed
+        end
+
+        if HighJumpEnabled and Humanoid then
+            -- prefer JumpPower
+            pcall(function()
+                Humanoid.JumpPower = HighJumpPower
+            end)
+        elseif Humanoid and originalJumpPower ~= nil then
+            pcall(function()
+                Humanoid.JumpPower = originalJumpPower
+            end)
         end
     end)
 end)
+
+-- Impact detection: เมื่อโดนชน (HumanoidRootPart.Touched) หรือเมื่อ "เซ" (บาง state เช่น FallingDown / GettingUp / PlatformStanding)
+-- จะเปิด anti-aim + anti-lock ชั่วคราว
+local function triggerImpactAnti(duration)
+    duration = tonumber(duration) or ImpactTriggerDuration
+    _impactActiveUntil = math.max(_impactActiveUntil, tick() + duration)
+end
+
+-- Touched handler: ถ้าโดนผู้เล่นอื่นหรือของที่มี Humanoid ให้ทริกเกอร์
+local function onPartTouched(otherPart)
+    if not ImpactTriggerEnabled then return end
+    if not otherPart or not otherPart.Parent then return end
+    local otherHum = otherPart.Parent:FindFirstChildOfClass("Humanoid")
+    if otherHum then
+        -- ถ้าเป็นผู้เล่นอื่นหรือมี humanoid ให้ทริกเกอร์
+        local otherPlayer = Players:GetPlayerFromCharacter(otherPart.Parent)
+        if otherPlayer and otherPlayer ~= LocalPlayer then
+            triggerImpactAnti(ImpactTriggerDuration)
+            return
+        else
+            -- ถ้าเป็น NPC หรือ object ที่มี humanoid ก็ทริกเกอร์เช่นกัน
+            triggerImpactAnti(ImpactTriggerDuration)
+            return
+        end
+    end
+end
+
+-- StateChanged handler: ตรวจหา state ที่เป็น "เซ" หรือถูกล้ม
+local function onStateChanged(old, new)
+    if not ImpactTriggerEnabled then return end
+    -- states that might indicate being stunned/knocked
+    if new == Enum.HumanoidStateType.FallingDown or new == Enum.HumanoidStateType.GettingUp or new == Enum.HumanoidStateType.PlatformStanding or new == Enum.HumanoidStateType.Ragdoll then
+        triggerImpactAnti(ImpactTriggerDuration)
+    end
+end
+
+-- Connect impact detection safely (reconnect when character spawns)
+local function connectImpactDetections()
+    pcall(function()
+        if HumanoidRootPart and Humanoid then
+            -- disconnect previous if any
+            if HumanoidRootPart._impactConn then
+                pcall(function() HumanoidRootPart._impactConn:Disconnect() end)
+            end
+            if Humanoid._stateConn then
+                pcall(function() Humanoid._stateConn:Disconnect() end)
+            end
+            HumanoidRootPart._impactConn = HumanoidRootPart.Touched:Connect(onPartTouched)
+            Humanoid._stateConn = Humanoid.StateChanged:Connect(onStateChanged)
+        end
+    end)
+end
 
 -- Loops
 RunService.Heartbeat:Connect(
@@ -1682,6 +1789,9 @@ LocalPlayer.CharacterAdded:Connect(
                 end
             end
         )
+        -- Reconnect impact detection when character respawns
+        setupCharacter(char)
+        connectImpactDetections()
     end
 )
 -- == Connections and Setup ==
@@ -1689,6 +1799,16 @@ LocalPlayer.CharacterAdded:Connect(setupCharacter)
 if LocalPlayer.Character then
     setupCharacter(LocalPlayer.Character)
 end
+
+-- Initial connect for impact detection
+connectImpactDetections()
+
+-- Provide function to externally trigger temporary anti-lock (useful for remote triggers)
+local function TemporarilyEnableCombined(duration)
+    duration = tonumber(duration) or ImpactTriggerDuration
+    _impactActiveUntil = math.max(_impactActiveUntil, tick() + duration)
+end
+
 UserInputService.InputBegan:Connect(
     function(input, gameProcessed)
         if gameProcessed then
@@ -2324,20 +2444,56 @@ local LegSinkSlider =
 )
 myConfig:Register("LegSinkAmount", LegSinkSlider)
 
--- New UI: Anti-Aim (หมุนตัวเร็ว ให้คนอื่นเห็น แต่เราไม่รู้สึก)
-local AntiAimToggle =
+-- Combined Anti-Lock + Anti-Aim toggle (user requested to merge into 1)
+local CombinedAntiToggle =
     Tab_Character:Toggle(
     {
-        Title = "Anti-Aim (Spin visible to others)",
-        Desc = "หมุนตัวให้คนอื่นเห็น แต่กล้องของเรายังนิ่ง",
+        Title = "Anti Lock (Combined)",
+        Desc = "เปิด Anti-Lock (Sky) และ Anti-Aim (spin) ด้วย toggle เดียวกัน",
         Default = false,
         Callback = function(state)
-            AntiAimEnabled = state
+            CombinedAntiLockEnabled = state
+            -- when user manually toggles, also set global Sky to match
+            getgenv().Sky = state
+            if state then
+                -- nothing else required: RunService loop will pick up CombinedAntiLockEnabled
+            else
+                -- clear any temp impact activation
+                _impactActiveUntil = 0
+            end
         end
     }
 )
-myConfig:Register("AntiAim", AntiAimToggle)
+myConfig:Register("CombinedAntiLock", CombinedAntiToggle)
 
+-- Impact-trigger toggle and duration slider
+local ImpactTriggerToggle =
+    Tab_Character:Toggle(
+    {
+        Title = "Trigger On Impact",
+        Desc = "เมื่อโดนชนหรือโดน 'เซ' ให้เปิด Anti-Lock/Anti-Aim ชั่วคราว",
+        Default = true,
+        Callback = function(state)
+            ImpactTriggerEnabled = state
+        end
+    }
+)
+myConfig:Register("ImpactTrigger", ImpactTriggerToggle)
+
+local ImpactDurationSlider =
+    Tab_Character:Slider(
+    {
+        Title = "Impact Duration (s)",
+        Step = 0.5,
+        Value = {Min = 0.5, Max = 10, Default = ImpactTriggerDuration},
+        Callback = function(value)
+            ImpactTriggerDuration = tonumber(value) or 3
+        end
+    }
+)
+myConfig:Register("ImpactDuration", ImpactDurationSlider)
+
+-- Anti-Aim Speed slider (still exposed)
 local AntiAimSpeedSlider =
     Tab_Character:Slider(
     {
@@ -2350,6 +2506,44 @@ local AntiAimSpeedSlider =
     }
 )
 myConfig:Register("AntiAimSpeed", AntiAimSpeedSlider)
+
+-- High jump support (including mobile)
+local HighJumpToggle =
+    Tab_Character:Toggle(
+    {
+        Title = "High Jump (Mobile support)",
+        Desc = "เพิ่มความสูงของการกระโดด รองรับมือถือด้วยการปรับ JumpPower",
+        Default = false,
+        Callback = function(state)
+            HighJumpEnabled = state
+            if Humanoid then
+                originalJumpPower = originalJumpPower or Humanoid.JumpPower
+                if state then
+                    pcall(function() Humanoid.JumpPower = HighJumpPower end)
+                else
+                    pcall(function() Humanoid.JumpPower = originalJumpPower end)
+                end
+            end
+        end
+    }
+)
+myConfig:Register("HighJump", HighJumpToggle)
+
+local HighJumpSlider =
+    Tab_Character:Slider(
+    {
+        Title = "Jump Power",
+        Step = 1,
+        Value = {Min = 20, Max = 200, Default = HighJumpPower},
+        Callback = function(value)
+            HighJumpPower = tonumber(value) or 70
+            if HighJumpEnabled and Humanoid then
+                pcall(function() Humanoid.JumpPower = HighJumpPower end)
+            end
+        end
+    }
+)
+myConfig:Register("HighJumpPower", HighJumpSlider)
 
 -- รอ
 local Net = {}
@@ -2476,17 +2670,21 @@ myConfig:Register("AutoSprint", AutoSprintToggle)
 local AntiLockToggle =
     Tab_Character:Toggle(
     {
-        Title = "Anti Lock",
+        Title = "Anti Lock (legacy)",
         Default = false,
         Callback = function(state)
+            -- legacy toggle kept for compatibility: will set getgenv().Sky only
             getgenv().Sky = state
-            if state then
-                getgenv().SkyAmount = 1500
+            if state and not CombinedAntiLockEnabled then
+                -- inform user: combined toggle is recommended
+                if WindUI then
+                    WindUI:Notify({Title = "⚠️ Notice", Description = "Use Combined Anti Lock for unified behavior", Duration = 2})
+                end
             end
         end
     }
 )
-myConfig:Register("AntiLock", AntiLockToggle)
+myConfig:Register("AntiLockLegacy", AntiLockToggle)
 local AntiKillToggle =
     Tab_Character:Toggle(
     {
