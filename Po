@@ -331,25 +331,46 @@ local function getClosestTarget()
     end
     return closest
 end
+-- 🔥 Predictive Aimbot (คำนวณนำหน้า + ชดเชย ping + gravity)
 local function predictPosition(head, hrp)
-    local ping = getPing()
-    local velocity = hrp and hrp.Velocity or Vector3.zero
-    return head.Position + (velocity * ping * 1.15)
+    if not head or not hrp then
+        return head and head.Position or Vector3.zero
+    end
+
+    local ping = (type(getPing) == "function" and getPing() or 0.2)
+    local velocity = hrp.Velocity or Vector3.zero
+    local distance = (Camera.CFrame.Position - head.Position).Magnitude
+    local bulletSpeed = 950
+    local travelTime = distance / math.max(bulletSpeed, 1)
+    local totalDelay = travelTime + ping * 1.2
+    local gravity = Vector3.new(0, -Workspace.Gravity, 0)
+    local predictedPos = head.Position + (velocity * totalDelay) + (0.5 * gravity * totalDelay * totalDelay)
+
+    local humanoid = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.MoveDirection.Magnitude > 0 then
+        predictedPos = predictedPos + humanoid.MoveDirection * (ping * 25)
+    end
+
+    predictedPos = predictedPos + Vector3.new(
+        (math.random() - 0.5) * 0.1,
+        (math.random() - 0.5) * 0.1,
+        (math.random() - 0.5) * 0.1
+    )
+    return predictedPos
 end
-local function isBehindWall(startPos, endPos)
-    if not startPos or not endPos then
-        return false
-    end
-    local ray = Ray.new(startPos, endPos - startPos)
-    local ignoreList = {}
-    if LocalPlayer.Character then
-        table.insert(ignoreList, LocalPlayer.Character)
-    end
-    if CurrentTarget and CurrentTarget.Character then
-        table.insert(ignoreList, CurrentTarget.Character)
-    end
-    local hit = Workspace:FindPartOnRayWithIgnoreList(ray, ignoreList)
-    return hit ~= nil
+-- 🔍 ฟังก์ชัน precise aim (เล็งเข้าแน่นกว่า)
+local function preciseAim(target)
+    if not target or not target.Character then return nil end
+    local head = target.Character:FindFirstChild("Head")
+    local hrp = target.Character:FindFirstChild("HumanoidRootPart")
+    if not head or not hrp then return nil end
+
+    local predicted = predictPosition(head, hrp)
+    local origin = Camera.CFrame.Position
+    local direction = (predicted - origin).Unit
+    local distance = (predicted - origin).Magnitude
+
+    return CFrame.new(origin, origin + direction) * CFrame.new(0, 0, -distance)
 end
 local function setupCharacter(char)
     Character = char
@@ -1414,37 +1435,129 @@ local function isShotgun()
     end
     return false
 end
+
+local AimbotPreciseEnabled = true  -- ยิงเข้าหัวคม
+local ShootThroughWhenBlocked = true -- มีกำแพงจะยิงทะลุอัตโนมัติ
+
+-- Predictive Aim (คำนวณล่วงหน้าตาม ping/velocity/gravity)
+local function predictPosition(head, hrp)
+    if not head or not hrp then
+        return head and head.Position or Vector3.zero
+    end
+
+    local ping = (type(getPing) == "function" and getPing() or 0.2)
+    local velocity = hrp.Velocity or Vector3.zero
+    local distance = (Camera.CFrame.Position - head.Position).Magnitude
+    local bulletSpeed = 950
+    local travelTime = distance / math.max(bulletSpeed, 1)
+    local totalDelay = travelTime + ping * 1.2
+    local gravity = Vector3.new(0, -Workspace.Gravity, 0)
+    local predictedPos = head.Position + (velocity * totalDelay) + (0.5 * gravity * totalDelay * totalDelay)
+
+    local humanoid = hrp.Parent and hrp.Parent:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.MoveDirection.Magnitude > 0 then
+        predictedPos = predictedPos + humanoid.MoveDirection * (ping * 25)
+    end
+
+    return predictedPos
+end
+
+-- เล็งเข้าหัวแม่นสุด
+local function preciseAim(target)
+    if not target or not target.Character then return nil end
+    local head = target.Character:FindFirstChild("Head")
+    local hrp = target.Character:FindFirstChild("HumanoidRootPart")
+    if not head or not hrp then return nil end
+
+    local predicted = predictPosition(head, hrp)
+    local origin = Camera.CFrame.Position
+    local direction = (predicted - origin).Unit
+    local distance = (predicted - origin).Magnitude
+    return CFrame.new(origin, origin + direction) * CFrame.new(0, 0, -distance)
+end
+
+-- ตรวจว่ามีกำแพงบังไหม
+local function isVisible(startPos, targetPos, targetCharacter)
+    if not startPos or not targetPos then return false end
+    local direction = (targetPos - startPos)
+    if direction.Magnitude <= 0 then return true end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.IgnoreWater = true
+
+    if LocalPlayer and LocalPlayer.Character then
+        params:AddToBlacklist(LocalPlayer.Character)
+    end
+
+    local result = Workspace:Raycast(startPos, direction, params)
+    if not result then
+        return true
+    end
+
+    if targetCharacter and result.Instance and result.Instance:IsDescendantOf(targetCharacter) then
+        return true
+    end
+
+    return false
+end
+
+-- Hook ยิงปืน
 local oldFire
 if Remote and Remote.FireServer then
-    local ok, res = pcall(function()
+    local ok, err = pcall(function()
         oldFire = hookfunction(Remote.FireServer, function(self, ...)
             if self ~= Remote then return oldFire(self, ...) end
             local args = {...}
-            if SilentAimEnabled and args[2] == "shoot_gun" and CurrentTarget then
-		local head = CurrentTarget.Character and CurrentTarget.Character:FindFirstChild("Head")
-		local hrp = CurrentTarget.Character and CurrentTarget.Character:FindFirstChild("HumanoidRootPart")
-		local humanoid = CurrentTarget.Character:FindFirstChild("Humanoid")
-		if head and humanoid and hrp then
-			local aimPos = predictPosition(head, hrp)
-			local displacement = aimPos - head.Position
-			local hitCFrame = CurrentTarget.Character:GetPivot() + displacement
-			local previousHealth = humanoid.Health
 
-			-- Check if target is behind a wall (calculated but not used for conditional logic in original; kept for potential future use)
-			local isObstructed = isBehindWall(LocalPlayer.Character.Head.Position, aimPos)
+            if (SilentAimEnabled or SilentAimAttachEnabled) and args[2] == "shoot_gun" and CurrentTarget then
+                local head = CurrentTarget.Character and CurrentTarget.Character:FindFirstChild("Head")
+                local hrp = CurrentTarget.Character and CurrentTarget.Character:FindFirstChild("HumanoidRootPart")
+                local humanoid = CurrentTarget.Character and CurrentTarget.Character:FindFirstChildOfClass("Humanoid")
+                local myChar = LocalPlayer.Character
+                local myPos = myChar and (myChar:FindFirstChild("Head") and myChar.Head.Position or (myChar:FindFirstChild("HumanoidRootPart") and myChar.HumanoidRootPart.Position)) or Vector3.zero
 
-			args[4] = CFrame.new(math.huge, math.huge, math.huge)
+                if head and humanoid and hrp then
+                    local visible = isVisible(myPos, head.Position, CurrentTarget.Character)
+                    local aimPos
 
-			args[5] = {
-				[1] = {
-					[1] = {
-						["Instance"] = head,
-						["Normal"] = Vector3.new(0, 1, 0),
-						["Position"] = aimPos
-					}
-				}
-			}
+                    if visible then
+                        -- ถ้าไม่มีสิ่งบัง: ยิงเข้าหัวแบบ precise
+                        if AimbotPreciseEnabled then
+                            local aimC = preciseAim(CurrentTarget)
+                            aimPos = (aimC and aimC.Position) or predictPosition(head, hrp)
+                        else
+                            aimPos = predictPosition(head, hrp)
+                        end
+                    else
+                        -- ถ้ามีกำแพง: ยิงทะลุ
+                        if ShootThroughWhenBlocked then
+                            aimPos = predictPosition(head, hrp)
+                        else
+                            return oldFire(self, unpack(args))
+                        end
+                    end
 
+                    args[4] = CFrame.new(math.huge, math.huge, math.huge)
+                    args[5] = {
+                        [1] = {
+                            [1] = {
+                                ["Instance"] = head,
+                                ["Normal"] = Vector3.new(0, 1, 0),
+                                ["Position"] = aimPos
+                            }
+                        }
+                    }
+                end
+            end
+
+            return oldFire(self, unpack(args))
+        end)
+    end)
+    if not ok then
+        warn("⚠️ Aimbot hook failed (wall-check):", err)
+    end
+end
                     -- ✅ เอฟเฟกต์กระสุน
                     local success, beam = pcall(function()
                         local part = Instance.new("Part")
